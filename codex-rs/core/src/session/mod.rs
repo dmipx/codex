@@ -23,6 +23,7 @@ use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::AppsInstructions;
 use crate::context::AvailablePluginsInstructions;
 use crate::context::AvailableSkillsInstructions;
+use crate::context::BackgroundTerminalNotification;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::NetworkRuleSaved;
@@ -1648,6 +1649,17 @@ impl Session {
             };
             self.send_event_raw(legacy_event).await;
         }
+    }
+
+    pub(crate) async fn queue_background_terminal_notification(
+        self: &Arc<Self>,
+        notification: BackgroundTerminalNotification,
+    ) {
+        let message = notification.into_response_input_item();
+        self.input_queue
+            .queue_response_items_for_next_turn(vec![message])
+            .await;
+        self.maybe_start_turn_for_pending_work().await;
     }
 
     /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.

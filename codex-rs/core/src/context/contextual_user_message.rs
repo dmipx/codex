@@ -3,6 +3,7 @@ use codex_protocol::items::parse_hook_prompt_fragment;
 use codex_protocol::models::ContentItem;
 
 use super::AdditionalContextUserFragment;
+use super::BackgroundTerminalNotification;
 use super::EnvironmentContext;
 use super::FragmentRegistration;
 use super::FragmentRegistrationProxy;
@@ -30,6 +31,9 @@ static TURN_ABORTED_REGISTRATION: FragmentRegistrationProxy<TurnAborted> =
     FragmentRegistrationProxy::new();
 static SUBAGENT_NOTIFICATION_REGISTRATION: FragmentRegistrationProxy<SubagentNotification> =
     FragmentRegistrationProxy::new();
+static BACKGROUND_TERMINAL_NOTIFICATION_REGISTRATION: FragmentRegistrationProxy<
+    BackgroundTerminalNotification,
+> = FragmentRegistrationProxy::new();
 static GOAL_CONTEXT_REGISTRATION: FragmentRegistrationProxy<GoalContext> =
     FragmentRegistrationProxy::new();
 static LEGACY_UNIFIED_EXEC_PROCESS_LIMIT_WARNING_REGISTRATION: FragmentRegistrationProxy<
@@ -50,6 +54,7 @@ static CONTEXTUAL_USER_FRAGMENTS: &[&dyn FragmentRegistration] = &[
     &USER_SHELL_COMMAND_REGISTRATION,
     &TURN_ABORTED_REGISTRATION,
     &SUBAGENT_NOTIFICATION_REGISTRATION,
+    &BACKGROUND_TERMINAL_NOTIFICATION_REGISTRATION,
     &GOAL_CONTEXT_REGISTRATION,
     &LEGACY_UNIFIED_EXEC_PROCESS_LIMIT_WARNING_REGISTRATION,
     &LEGACY_APPLY_PATCH_EXEC_COMMAND_WARNING_REGISTRATION,

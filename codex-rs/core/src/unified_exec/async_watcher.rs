@@ -2,12 +2,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
 
 use super::UnifiedExecContext;
 use super::process::UnifiedExecProcess;
+use crate::context::BackgroundTerminalNotification;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -15,12 +17,14 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
 use crate::tools::events::ToolEventStage;
+use crate::tools::format_exec_output_str;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExecCommandOutputDeltaEvent;
 use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExecCommandStatus;
 use codex_protocol::protocol::ExecOutputStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
 
@@ -33,6 +37,42 @@ pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
 /// downstream event consumers (especially app-server JSON-RPC) don't have to
 /// process arbitrarily large delta payloads.
 const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
+
+pub(crate) struct BackgroundExitNotificationGate {
+    decision_tx: watch::Sender<Option<bool>>,
+    fallback_after: Duration,
+}
+
+impl BackgroundExitNotificationGate {
+    pub(crate) fn new(fallback_after: Duration) -> Arc<Self> {
+        let (decision_tx, _) = watch::channel(None);
+        Arc::new(Self {
+            decision_tx,
+            fallback_after,
+        })
+    }
+
+    pub(crate) fn decide(&self, should_notify: bool) {
+        self.decision_tx.send_replace(Some(should_notify));
+    }
+
+    pub(super) async fn should_notify_on_exit(&self) -> bool {
+        let mut decision_rx = self.decision_tx.subscribe();
+        if let Some(should_notify) = *decision_rx.borrow() {
+            return should_notify;
+        }
+
+        tokio::select! {
+            changed = decision_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+                decision_rx.borrow().unwrap_or(false)
+            }
+            _ = tokio::time::sleep(self.fallback_after) => true,
+        }
+    }
+}
 
 /// Spawn a background task that continuously reads from the PTY, appends to the
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
@@ -114,6 +154,7 @@ pub(crate) fn spawn_exit_watcher(
     process_id: i32,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
+    exit_notification_gate: Arc<BackgroundExitNotificationGate>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
@@ -135,6 +176,7 @@ pub(crate) fn spawn_exit_watcher(
                 String::new(),
                 message,
                 duration,
+                Some(exit_notification_gate),
             )
             .await;
         } else {
@@ -150,6 +192,7 @@ pub(crate) fn spawn_exit_watcher(
                 String::new(),
                 exit_code,
                 duration,
+                Some(exit_notification_gate),
             )
             .await;
         }
@@ -203,6 +246,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     fallback_output: String,
     exit_code: i32,
     duration: Duration,
+    exit_notification_gate: Option<Arc<BackgroundExitNotificationGate>>,
 ) {
     let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
     let output = ExecToolCallOutput {
@@ -213,6 +257,23 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         duration,
         timed_out: false,
     };
+    let formatted_output = format_exec_output_str(&output, turn_ref.truncation_policy);
+    let notification = BackgroundTerminalNotification::new(
+        call_id.clone(),
+        process_id.clone(),
+        command.clone(),
+        cwd.as_path().display().to_string(),
+        exit_code,
+        if exit_code == 0 {
+            ExecCommandStatus::Completed
+        } else {
+            ExecCommandStatus::Failed
+        },
+        duration,
+        &output.stdout.text,
+        &output.stderr.text,
+        formatted_output,
+    );
     let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),
@@ -234,6 +295,8 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
             },
         )
         .await;
+    maybe_queue_background_terminal_notification(session_ref, exit_notification_gate, notification)
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -248,6 +311,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     fallback_output: String,
     message: String,
     duration: Duration,
+    exit_notification_gate: Option<Arc<BackgroundExitNotificationGate>>,
 ) {
     let stdout = if fallback_output.is_empty() {
         resolve_aggregated_output(&transcript, fallback_output).await
@@ -267,6 +331,19 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         duration,
         timed_out: false,
     };
+    let formatted_output = format_exec_output_str(&output, turn_ref.truncation_policy);
+    let notification = BackgroundTerminalNotification::new(
+        call_id.clone(),
+        process_id.clone(),
+        command.clone(),
+        cwd.as_path().display().to_string(),
+        -1,
+        ExecCommandStatus::Failed,
+        duration,
+        &output.stdout.text,
+        &output.stderr.text,
+        formatted_output,
+    );
     let event_ctx = ToolEventCtx::new(
         session_ref.as_ref(),
         turn_ref.as_ref(),
@@ -284,6 +361,25 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
             event_ctx,
             ToolEventStage::Failure(ToolEventFailure::Output(output)),
         )
+        .await;
+    maybe_queue_background_terminal_notification(session_ref, exit_notification_gate, notification)
+        .await;
+}
+
+async fn maybe_queue_background_terminal_notification(
+    session_ref: Arc<Session>,
+    exit_notification_gate: Option<Arc<BackgroundExitNotificationGate>>,
+    notification: BackgroundTerminalNotification,
+) {
+    let Some(exit_notification_gate) = exit_notification_gate else {
+        return;
+    };
+    if !exit_notification_gate.should_notify_on_exit().await {
+        return;
+    }
+
+    session_ref
+        .queue_background_terminal_notification(notification)
         .await;
 }
 

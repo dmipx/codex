@@ -8,6 +8,7 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::async_watcher::BackgroundExitNotificationGate;
 use crate::unified_exec::process::OutputHandles;
 use codex_sandboxing::SandboxType;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -118,6 +119,7 @@ async fn exec_command_with_tty(
             hook_command: cmd.to_string(),
             tty,
             network_approval: None,
+            exit_notification_gate: BackgroundExitNotificationGate::new(Duration::from_secs(1)),
             session: Arc::downgrade(session),
             last_used: started_at,
         };
@@ -518,6 +520,80 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
             .processes
             .is_empty()
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_stdin_consumed_exit_suppresses_background_notification() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+
+    let open_shell = exec_command(
+        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+    )
+    .await?;
+    let process_id = open_shell.process_id.expect("expected process id");
+
+    let exit_notification_gate = {
+        let store = session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await;
+        Arc::clone(
+            &store
+                .processes
+                .get(&process_id)
+                .expect("stored process")
+                .exit_notification_gate,
+        )
+    };
+
+    write_stdin(&session, process_id, "exit\n", /*yield_time_ms*/ 2_500).await?;
+
+    assert!(!exit_notification_gate.should_notify_on_exit().await);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn suppressing_release_decides_background_notification_gate_false() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+
+    let open_shell = exec_command(
+        &session, &turn, "bash -i", /*yield_time_ms*/ 2_500, /*workdir*/ None,
+    )
+    .await?;
+    let process_id = open_shell.process_id.expect("expected process id");
+
+    let exit_notification_gate = {
+        let store = session
+            .services
+            .unified_exec_manager
+            .process_store
+            .lock()
+            .await;
+        Arc::clone(
+            &store
+                .processes
+                .get(&process_id)
+                .expect("stored process")
+                .exit_notification_gate,
+        )
+    };
+
+    session
+        .services
+        .unified_exec_manager
+        .release_process_id_suppressing_exit_notification(process_id)
+        .await;
+
+    assert!(!exit_notification_gate.should_notify_on_exit().await);
 
     Ok(())
 }

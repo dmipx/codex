@@ -1,6 +1,8 @@
+use super::BackgroundExitNotificationGate;
 use super::split_valid_utf8_prefix_with_max;
 
 use pretty_assertions::assert_eq;
+use tokio::time::Duration;
 
 #[test]
 fn split_valid_utf8_prefix_respects_max_bytes_for_ascii() {
@@ -36,4 +38,20 @@ fn split_valid_utf8_prefix_makes_progress_on_invalid_utf8() {
         split_valid_utf8_prefix_with_max(&mut buf, /*max_bytes*/ 2).expect("expected prefix");
     assert_eq!(first, vec![0xff]);
     assert_eq!(buf, b"ab".to_vec());
+}
+
+#[tokio::test]
+async fn background_exit_notification_gate_uses_decision() {
+    let gate = BackgroundExitNotificationGate::new(Duration::from_secs(10));
+
+    gate.decide(false);
+
+    assert!(!gate.should_notify_on_exit().await);
+}
+
+#[tokio::test]
+async fn background_exit_notification_gate_falls_back_to_notify() {
+    let gate = BackgroundExitNotificationGate::new(Duration::from_millis(1));
+
+    assert!(gate.should_notify_on_exit().await);
 }
