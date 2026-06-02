@@ -8315,6 +8315,126 @@ async fn queued_response_items_for_next_turn_move_into_next_active_turn() {
 }
 
 #[tokio::test]
+async fn steered_user_input_has_priority_over_queued_next_turn_items() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let queued_item = ResponseInputItem::Message {
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "queued background notification".to_string(),
+        }],
+        phase: None,
+    };
+
+    sess.input_queue
+        .queue_response_items_for_next_turn(vec![queued_item.clone()])
+        .await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    sess.steer_input(
+        vec![UserInput::Text {
+            text: "prompt input".to_string(),
+            text_elements: Vec::new(),
+        }],
+        /*additional_context*/ Default::default(),
+        Some(&tc.sub_id),
+        /*responsesapi_client_metadata*/ None,
+    )
+    .await
+    .expect("user input should steer into active regular turn");
+
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![
+            TurnInput::UserInput(vec![UserInput::Text {
+                text: "prompt input".to_string(),
+                text_elements: Vec::new(),
+            }]),
+            TurnInput::ResponseInputItem(queued_item),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn active_turn_observes_queued_next_turn_items() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let queued_item = ResponseInputItem::Message {
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "queued background notification".to_string(),
+        }],
+        phase: None,
+    };
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    sess.input_queue
+        .queue_response_items_for_next_turn(vec![queued_item.clone()])
+        .await;
+
+    assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![TurnInput::ResponseInputItem(queued_item)]
+    );
+}
+
+#[tokio::test]
+async fn background_terminal_notification_injects_into_active_turn() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let notification = crate::context::BackgroundTerminalNotification::new(
+        "call-1".to_string(),
+        Some("process-1".to_string()),
+        vec!["true".to_string()],
+        "/tmp".to_string(),
+        0,
+        codex_protocol::protocol::ExecCommandStatus::Completed,
+        Duration::from_millis(1),
+        "stdout",
+        "",
+        "stdout".to_string(),
+    );
+    let expected_item = notification.clone().into_response_input_item();
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    sess.queue_background_terminal_notification(notification).await;
+
+    assert!(sess.input_queue.has_pending_input(&sess.active_turn).await);
+    assert!(
+        !sess
+            .input_queue
+            .has_queued_response_items_for_next_turn()
+            .await
+    );
+    assert_eq!(
+        sess.input_queue.get_pending_input(&sess.active_turn).await,
+        vec![TurnInput::ResponseInputItem(expected_item)]
+    );
+}
+
+#[tokio::test]
 async fn idle_interrupt_does_not_wake_queued_next_turn_items() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let queued_item = ResponseInputItem::Message {

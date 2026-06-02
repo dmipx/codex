@@ -236,11 +236,17 @@ impl InputQueue {
             .await
             .into_iter()
             .map(TurnInput::ResponseInputItem);
+        let queued_response_items = self
+            .take_queued_response_items_for_next_turn()
+            .await
+            .into_iter()
+            .map(TurnInput::ResponseInputItem);
         if pending_input.is_empty() {
-            mailbox_items.collect()
+            mailbox_items.chain(queued_response_items).collect()
         } else {
             let mut pending_input = pending_input;
             pending_input.extend(mailbox_items);
+            pending_input.extend(queued_response_items);
             pending_input
         }
     }
@@ -270,6 +276,7 @@ impl InputQueue {
             return false;
         }
         self.has_pending_mailbox_items().await
+            || self.has_queued_response_items_for_next_turn().await
     }
 }
 

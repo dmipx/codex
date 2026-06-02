@@ -347,11 +347,13 @@ impl Session {
         {
             warn!("failed to apply goal runtime turn-start event: {err}");
         }
-        let queued_response_items = self
+        let mailbox_items = self
             .input_queue
-            .take_queued_response_items_for_next_turn()
-            .await;
-        let mailbox_items = self.input_queue.get_pending_input(&self.active_turn).await;
+            .drain_mailbox_input_items()
+            .await
+            .into_iter()
+            .map(TurnInput::ResponseInputItem)
+            .collect::<Vec<_>>();
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
@@ -359,13 +361,8 @@ impl Session {
             Arc::clone(&turn.turn_state)
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
-        let mut pending_items = queued_response_items
-            .into_iter()
-            .map(TurnInput::ResponseInputItem)
-            .collect::<Vec<_>>();
-        pending_items.extend(mailbox_items);
         self.input_queue
-            .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
+            .extend_pending_input_for_turn_state(turn_state.as_ref(), mailbox_items)
             .await;
         self.emit_turn_start_lifecycle(turn_context.as_ref(), &token_usage_at_turn_start)
             .await;

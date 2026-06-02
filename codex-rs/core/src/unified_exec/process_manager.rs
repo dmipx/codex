@@ -38,6 +38,7 @@ use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::async_watcher::BackgroundExitNotificationGate;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
@@ -301,6 +302,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         fallback_output,
         message,
         wall_time,
+        None,
     )
     .await;
 }
@@ -366,6 +368,17 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    pub(super) async fn release_process_id_suppressing_exit_notification(&self, process_id: i32) {
+        let removed = {
+            let mut store = self.process_store.lock().await;
+            store.remove(process_id)
+        };
+        if let Some(entry) = removed {
+            entry.exit_notification_gate.decide(false);
+            unregister_network_approval_for_entry(&entry).await;
+        }
+    }
+
     pub(crate) async fn exec_command(
         &self,
         request: ExecCommandRequest,
@@ -394,6 +407,10 @@ impl UnifiedExecProcessManager {
         }
 
         let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+        let yield_time_ms = clamp_yield_time(request.yield_time_ms);
+        let exit_notification_gate = BackgroundExitNotificationGate::new(
+            Duration::from_millis(yield_time_ms).saturating_add(Duration::from_millis(250)),
+        );
         let event_ctx = ToolEventCtx::new(
             context.session.as_ref(),
             context.turn.as_ref(),
@@ -425,11 +442,11 @@ impl UnifiedExecProcessManager {
                 request.tty,
                 deferred_network_approval.clone(),
                 Arc::clone(&transcript),
+                Arc::clone(&exit_notification_gate),
             )
             .await;
         }
 
-        let yield_time_ms = clamp_yield_time(request.yield_time_ms);
         // For the initial exec_command call, we both stream output to events
         // (via start_streaming_output above) and collect a snapshot here for
         // the tool response body.
@@ -479,6 +496,9 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
+            if process_started_alive {
+                exit_notification_gate.decide(false);
+            }
             self.release_process_id(request.process_id).await;
             return Err(fail_process_with_message(process.as_ref(), message));
         }
@@ -499,6 +519,9 @@ impl UnifiedExecProcessManager {
                 wall_time,
             )
             .await;
+            if process_started_alive {
+                exit_notification_gate.decide(false);
+            }
             self.release_process_id(request.process_id).await;
             if let Err(message) = finish_result {
                 return Err(fail_process_with_message(process.as_ref(), message));
@@ -514,6 +537,7 @@ impl UnifiedExecProcessManager {
                     ..
                 } => (Some(process_id), exit_code),
                 ProcessStatus::Exited { exit_code, entry } => {
+                    exit_notification_gate.decide(false);
                     if let Err(message) =
                         finish_deferred_network_approval_after_process_exit_for_session(
                             Some(&context.session),
@@ -527,6 +551,7 @@ impl UnifiedExecProcessManager {
                     (None, exit_code)
                 }
                 ProcessStatus::Unknown => {
+                    exit_notification_gate.decide(false);
                     return Err(UnifiedExecError::UnknownProcessId { process_id });
                 }
             }
@@ -567,6 +592,7 @@ impl UnifiedExecProcessManager {
                 text.clone(),
                 exit,
                 wall_time,
+                None,
             )
             .await;
 
@@ -574,6 +600,7 @@ impl UnifiedExecProcessManager {
             process.check_for_sandbox_denial_with_text(&text).await?;
             (None, exit_code)
         };
+        exit_notification_gate.decide(response_process_id.is_some());
 
         let original_token_count = approx_token_count(&text);
         let response = ExecCommandToolOutput {
@@ -631,7 +658,8 @@ impl UnifiedExecProcessManager {
                         status_after_write = Some(status);
                     } else if matches!(err, UnifiedExecError::ProcessFailed { .. }) {
                         process.terminate();
-                        self.release_process_id(process_id).await;
+                        self.release_process_id_suppressing_exit_notification(process_id)
+                            .await;
                         return Err(err);
                     } else {
                         return Err(err);
@@ -674,7 +702,8 @@ impl UnifiedExecProcessManager {
             let message =
                 network_denial_message_for_session(session.as_ref(), network_approval.clone())
                     .await;
-            self.release_process_id(process_id).await;
+            self.release_process_id_suppressing_exit_notification(process_id)
+                .await;
             return Err(fail_process_with_message(process.as_ref(), message));
         }
         if let Some(message) = process.failure_message() {
@@ -683,7 +712,8 @@ impl UnifiedExecProcessManager {
                 network_approval.clone(),
             )
             .await;
-            self.release_process_id(process_id).await;
+            self.release_process_id_suppressing_exit_notification(process_id)
+                .await;
             if let Err(message) = finish_result {
                 return Err(fail_process_with_message(process.as_ref(), message));
             }
@@ -751,6 +781,7 @@ impl UnifiedExecProcessManager {
                 let Some(entry) = store.remove(process_id) else {
                     return ProcessStatus::Unknown;
                 };
+                entry.exit_notification_gate.decide(false);
                 ProcessStatus::Exited {
                     exit_code,
                     entry: Box::new(entry),
@@ -817,6 +848,7 @@ impl UnifiedExecProcessManager {
         tty: bool,
         network_approval: Option<DeferredNetworkApproval>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
+        exit_notification_gate: Arc<BackgroundExitNotificationGate>,
     ) {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
@@ -825,6 +857,7 @@ impl UnifiedExecProcessManager {
             hook_command,
             tty,
             network_approval,
+            exit_notification_gate: Arc::clone(&exit_notification_gate),
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
@@ -851,6 +884,7 @@ impl UnifiedExecProcessManager {
             process_id,
             transcript,
             started_at,
+            exit_notification_gate,
         );
     }
 
