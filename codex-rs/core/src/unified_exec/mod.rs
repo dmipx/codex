@@ -158,6 +158,7 @@ struct ProcessEntry {
     hook_command: String,
     tty: bool,
     network_approval: Option<DeferredNetworkApproval>,
+    exit_notification_gate: Arc<crate::unified_exec::async_watcher::BackgroundExitNotificationGate>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
 }
