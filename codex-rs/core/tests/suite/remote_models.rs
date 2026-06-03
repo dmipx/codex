@@ -251,8 +251,9 @@ async fn remote_models_config_override_above_max_uses_max_context_window() -> Re
 }
 
 /// Scenario: GPT-5.5 advertises a conservative default context window and a
-/// larger long-context max. This verifies a user override below that max reaches
-/// the runtime turn instead of being capped at the default window.
+/// larger long-context max. This verifies a user override at that max reaches
+/// the runtime turn, with normal model headroom applied, instead of being
+/// capped at the default window.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_models_gpt_5_5_long_context_override_reaches_runtime() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -264,7 +265,6 @@ async fn remote_models_gpt_5_5_long_context_override_reaches_runtime() -> Result
         test_remote_model("gpt-5.5", ModelVisibility::List, /*priority*/ 1_000);
     remote_model.context_window = Some(272_000);
     remote_model.max_context_window = Some(1_050_000);
-    remote_model.effective_context_window_percent = 100;
     mount_models_once(
         &server,
         ModelsResponse {
@@ -282,7 +282,7 @@ async fn remote_models_gpt_5_5_long_context_override_reaches_runtime() -> Result
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             config.model = Some(requested_model.to_string());
-            config.model_context_window = Some(1_000_000);
+            config.model_context_window = Some(1_050_000);
         })
         .build(&server)
         .await?;
@@ -305,7 +305,7 @@ async fn remote_models_gpt_5_5_long_context_override_reaches_runtime() -> Result
         matches!(
             event,
             EventMsg::TurnStarted(started)
-                if started.model_context_window == Some(1_000_000)
+                if started.model_context_window == Some(997_500)
         )
     })
     .await;
@@ -313,7 +313,7 @@ async fn remote_models_gpt_5_5_long_context_override_reaches_runtime() -> Result
         unreachable!("wait_for_event returned unexpected event");
     };
 
-    assert_eq!(turn_started.model_context_window, Some(1_000_000));
+    assert_eq!(turn_started.model_context_window, Some(997_500));
 
     Ok(())
 }

@@ -281,7 +281,7 @@ async fn get_model_info_uses_custom_catalog() {
 #[tokio::test]
 async fn get_model_info_applies_gpt_5_5_long_context_override() {
     let config = ModelsManagerConfig {
-        model_context_window: Some(1_000_000),
+        model_context_window: Some(1_050_000),
         ..Default::default()
     };
     let manager =
@@ -290,7 +290,7 @@ async fn get_model_info_applies_gpt_5_5_long_context_override() {
     let model_info = manager.get_model_info("gpt-5.5", &config).await;
 
     assert_eq!(model_info.max_context_window, Some(1_050_000));
-    assert_eq!(model_info.context_window, Some(1_000_000));
+    assert_eq!(model_info.context_window, Some(1_050_000));
 }
 
 #[tokio::test]
