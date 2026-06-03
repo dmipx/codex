@@ -250,6 +250,74 @@ async fn remote_models_config_override_above_max_uses_max_context_window() -> Re
     Ok(())
 }
 
+/// Scenario: GPT-5.5 advertises a conservative default context window and a
+/// larger long-context max. This verifies a user override below that max reaches
+/// the runtime turn instead of being capped at the default window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_models_gpt_5_5_long_context_override_reaches_runtime() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = MockServer::start().await;
+    let requested_model = "gpt-5.5-test";
+    let mut remote_model =
+        test_remote_model("gpt-5.5", ModelVisibility::List, /*priority*/ 1_000);
+    remote_model.context_window = Some(272_000);
+    remote_model.max_context_window = Some(1_050_000);
+    remote_model.effective_context_window_percent = 100;
+    mount_models_once(
+        &server,
+        ModelsResponse {
+            models: vec![remote_model],
+        },
+    )
+    .await;
+    mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            config.model = Some(requested_model.to_string());
+            config.model_context_window = Some(1_000_000);
+        })
+        .build(&server)
+        .await?;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "check long context window".into(),
+                text_elements: Vec::new(),
+            }],
+            environments: None,
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let turn_started_event = wait_for_event(&codex, |event| {
+        matches!(
+            event,
+            EventMsg::TurnStarted(started)
+                if started.model_context_window == Some(1_000_000)
+        )
+    })
+    .await;
+    let EventMsg::TurnStarted(turn_started) = turn_started_event else {
+        unreachable!("wait_for_event returned unexpected event");
+    };
+
+    assert_eq!(turn_started.model_context_window, Some(1_000_000));
+
+    Ok(())
+}
+
 /// Scenario: model metadata includes both context_window and max_context_window,
 /// but the user did not configure an override. This verifies the runtime keeps
 /// using the model's default context_window in the no-override path.
